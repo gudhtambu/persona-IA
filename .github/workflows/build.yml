@@ -1,0 +1,390 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crear proyecto
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.personaia"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.personaia"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application android:label="Persona IA" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="floating assistant bubble" />
+                  </service>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/personaia
+          cat > app/src/main/java/com/example/personaia/Api.kt <<'EOF_FILE'
+          package com.example.personaia
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Api {
+              fun chat(key: String, system: String, msgs: JSONArray, model: String): String {
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                      .openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.setRequestProperty("content-type", "application/json")
+                  c.doOutput = true
+                  val contents = JSONArray()
+                  for (i in 0 until msgs.length()) {
+                      val m = msgs.getJSONObject(i)
+                      val role = if (m.getString("role") == "assistant") "model" else "user"
+                      contents.put(JSONObject().put("role", role)
+                          .put("parts", JSONArray().put(JSONObject().put("text", m.getString("content")))))
+                  }
+                  val sys = "$system Responde corto, como en un chat, en el idioma del usuario."
+                  val body = JSONObject()
+                      .put("system_instruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+                      .put("contents", contents)
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val code = c.responseCode
+                  val s = (if (code < 400) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (code >= 400) {
+                      val msg = try { JSONObject(s).getJSONObject("error").getString("message") } catch (e: Exception) { "" }
+                      throw Exception("HTTP $code $msg".take(200))
+                  }
+                  return JSONObject(s).getJSONArray("candidates").getJSONObject(0)
+                      .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/personaia
+          cat > app/src/main/java/com/example/personaia/BootReceiver.kt <<'EOF_FILE'
+          package com.example.personaia
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.provider.Settings
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  if (i.action == Intent.ACTION_BOOT_COMPLETED && Settings.canDrawOverlays(c)) {
+                      c.startForegroundService(Intent(c, OverlayService::class.java))
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/personaia
+          cat > app/src/main/java/com/example/personaia/MainActivity.kt <<'EOF_FILE'
+          package com.example.personaia
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 100, 40, 40) }
+                  fun label(t: String) = root.addView(TextView(this).apply { text = t; setPadding(0, 30, 0, 0) })
+                  fun field(t: String, key: String, def: String, lines: Int = 1): EditText {
+                      label(t)
+                      return EditText(this).apply { setText(sp.getString(key, def)); minLines = lines; root.addView(this) }
+                  }
+                  fun button(t: String, f: () -> Unit) = root.addView(Button(this).apply { text = t; setOnClickListener { f() } })
+
+                  val key = field("Clave de API de Google AI Studio (gratis)", "key", "")
+                  val model = field("Modelo de Gemini", "model", "gemini-flash-latest")
+                  val emoji = field("Emoji del personaje", "emoji", "🤖")
+                  val name = field("Nombre", "name", "Asistente")
+                  val prompt = field("Personalidad (tú decides cómo habla y actúa)", "prompt",
+                      "Eres un asistente amable y directo.", 4)
+
+                  fun save() = sp.edit()
+                      .putString("key", key.text.toString().trim())
+                      .putString("model", model.text.toString().trim().ifBlank { "gemini-flash-latest" })
+                      .putString("emoji", emoji.text.toString().ifBlank { "🤖" })
+                      .putString("name", name.text.toString().ifBlank { "Asistente" })
+                      .putString("prompt", prompt.text.toString())
+                      .apply()
+
+                  button("1. Dar permiso de superposición") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  button("2. Guardar e iniciar burbuja") {
+                      save()
+                      if (!Settings.canDrawOverlays(this)) {
+                          Toast.makeText(this, "Falta el permiso de superposición", Toast.LENGTH_LONG).show()
+                      } else {
+                          stopService(Intent(this, OverlayService::class.java))
+                          startForegroundService(Intent(this, OverlayService::class.java))
+                          Toast.makeText(this, "Burbuja activa. Se iniciará sola al encender el teléfono.", Toast.LENGTH_LONG).show()
+                      }
+                  }
+                  button("Detener burbuja") { stopService(Intent(this, OverlayService::class.java)) }
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/personaia
+          cat > app/src/main/java/com/example/personaia/OverlayService.kt <<'EOF_FILE'
+          package com.example.personaia
+
+          import android.animation.ValueAnimator
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.*
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import kotlin.math.abs
+          import kotlin.random.Random
+
+          class OverlayService : Service() {
+              private lateinit var wm: WindowManager
+              private val h = Handler(Looper.getMainLooper())
+              private val history = JSONArray()
+              private var bubble: TextView? = null
+              private var panel: LinearLayout? = null
+              private var log: TextView? = null
+              private var scroll: ScrollView? = null
+              private var dragging = false
+              private lateinit var bp: WindowManager.LayoutParams
+              private val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  if (bubble == null) { startFg(); createBubble() }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  h.removeCallbacksAndMessages(null)
+                  panel?.let { wm.removeView(it) }
+                  bubble?.let { wm.removeView(it) }
+                  bubble = null; panel = null
+                  super.onDestroy()
+              }
+
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("ia", "Asistente", NotificationManager.IMPORTANCE_MIN))
+                  val n = Notification.Builder(this, "ia").setContentTitle("Asistente activo")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info).build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else startForeground(1, n)
+              }
+
+              private fun createBubble() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val t = TextView(this).apply {
+                      text = sp.getString("emoji", "🤖"); textSize = 30f; gravity = Gravity.CENTER
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF6C4CF1.toInt()) }
+                  }
+                  bp = WindowManager.LayoutParams(170, 170, type, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT)
+                      .apply { gravity = Gravity.TOP or Gravity.START; x = 40; y = 500 }
+                  var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+                  t.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = bp.x; oy = bp.y; moved = false; dragging = true; true }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - sx).toInt(); val dy = (e.rawY - sy).toInt()
+                              if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                              bp.x = ox + dx; bp.y = oy + dy; wm.updateViewLayout(t, bp); true
+                          }
+                          MotionEvent.ACTION_UP -> { dragging = false; if (!moved) togglePanel(); true }
+                          else -> false
+                      }
+                  }
+                  wm.addView(t, bp); bubble = t
+                  h.postDelayed(drift, 5000)
+              }
+
+              // La burbuja se mueve sola por la pantalla cuando está en reposo
+              private val drift = object : Runnable {
+                  override fun run() {
+                      val b = bubble
+                      if (b != null && !dragging && panel == null) {
+                          val dm = resources.displayMetrics
+                          val tx = Random.nextInt(0, dm.widthPixels - 170)
+                          val ty = Random.nextInt(150, dm.heightPixels - 400)
+                          val x0 = bp.x; val y0 = bp.y
+                          ValueAnimator.ofFloat(0f, 1f).apply {
+                              duration = 4000
+                              addUpdateListener {
+                                  if (dragging || panel != null) { cancel(); return@addUpdateListener }
+                                  val f = it.animatedValue as Float
+                                  bp.x = (x0 + (tx - x0) * f).toInt(); bp.y = (y0 + (ty - y0) * f).toInt()
+                                  try { wm.updateViewLayout(b, bp) } catch (_: Exception) {}
+                              }
+                              start()
+                          }
+                      }
+                      h.postDelayed(this, 7000)
+                  }
+              }
+
+              private fun togglePanel() {
+                  if (panel != null) { wm.removeView(panel); panel = null; return }
+                  val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val p = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xEE202026.toInt()); setPadding(24, 60, 24, 24) }
+                  val sc = ScrollView(this); val lg = TextView(this).apply { setTextColor(Color.WHITE); textSize = 15f }
+                  sc.addView(lg); p.addView(sc, LinearLayout.LayoutParams(-1, 0, 1f))
+                  val row = LinearLayout(this)
+                  val inp = EditText(this).apply { setTextColor(Color.WHITE); hint = "Escribe… (o: abre youtube)"; setHintTextColor(Color.GRAY) }
+                  val send = Button(this).apply { text = "➤" }
+                  val close = Button(this).apply { text = "✕" }
+                  row.addView(inp, LinearLayout.LayoutParams(0, -2, 1f)); row.addView(send); row.addView(close)
+                  p.addView(row)
+                  log = lg; scroll = sc
+                  val name = sp.getString("name", "Asistente")!!
+                  fun go() {
+                      val q = inp.text.toString().trim(); if (q.isEmpty()) return
+                      inp.setText(""); add("Tú: $q")
+                      if (!command(q)) ask(q, name)
+                  }
+                  send.setOnClickListener { go() }
+                  close.setOnClickListener { togglePanel() }
+                  val lp = WindowManager.LayoutParams(-1, resources.displayMetrics.heightPixels * 55 / 100, type,
+                      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL, PixelFormat.TRANSLUCENT)
+                      .apply { gravity = Gravity.TOP; softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE }
+                  wm.addView(p, lp); panel = p
+                  if (history.length() == 0) add("$name: ¡Hola! ¿En qué te ayudo?")
+              }
+
+              private fun add(s: String) {
+                  log?.append(s + "\n\n"); scroll?.post { scroll?.fullScroll(View.FOCUS_DOWN) }
+              }
+
+              // "abre youtube" abre una app instalada; "abre google.com" abre una página
+              private fun command(q: String): Boolean {
+                  if (!q.lowercase().startsWith("abre ")) return false
+                  val target = q.substring(5).trim()
+                  if (target.startsWith("http") || (target.contains(".") && !target.contains(" "))) {
+                      val u = if (target.startsWith("http")) target else "https://$target"
+                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      add("Abriendo $u"); return true
+                  }
+                  val pm = packageManager
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val m = apps.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(target.lowercase()) }
+                  if (m == null) { add("No encontré esa app."); return true }
+                  pm.getLaunchIntentForPackage(m.activityInfo.packageName)?.let { startActivity(it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                  add("Abriendo ${m.loadLabel(pm)}"); togglePanel()
+                  return true
+              }
+
+              private fun ask(q: String, name: String) {
+                  val sp = getSharedPreferences("cfg", MODE_PRIVATE)
+                  history.put(JSONObject().put("role", "user").put("content", q))
+                  Thread {
+                      val reply = try { Api.chat(sp.getString("key", "")!!, sp.getString("prompt", "")!!, history, sp.getString("model", "gemini-flash-latest")!!) }
+                      catch (e: Exception) { null to (e.message ?: "error") }
+                      h.post {
+                          if (reply is String) {
+                              history.put(JSONObject().put("role", "assistant").put("content", reply)); add("$name: $reply")
+                          } else {
+                              history.remove(history.length() - 1); add("Error: ${(reply as Pair<*, *>).second}")
+                          }
+                      }
+                  }.start()
+              }
+          }
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.0" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p gradle/wrapper
+          cat > gradle/wrapper/gradle-wrapper.properties <<'EOF_FILE'
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          EOF_FILE
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PersonaIA"
+          include(":app")
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PersonaIA-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
